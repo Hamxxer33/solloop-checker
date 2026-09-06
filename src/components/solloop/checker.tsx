@@ -57,7 +57,7 @@ export function Checker() {
 
   async function runCheck() {
     if (!requiredTasksReady) {
-      setError("Follow X and join Telegram first.");
+      setError("Complete the required tasks first.");
       return;
     }
     const address = wallet.trim();
@@ -190,7 +190,7 @@ export function Checker() {
             <div className="panel rounded-2xl bg-bg-elevated p-5 sm:p-6">
               <p className="text-xs font-medium text-muted">1 · Tasks</p>
               <p className="mt-1 mb-4 text-sm text-fg">
-                Follow and join, then paste a wallet.
+                Complete the required tasks below, then paste a wallet.
               </p>
 
               <TaskList
