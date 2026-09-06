@@ -1,0 +1,11 @@
+{
+  "asOf": null,
+  "note": "OG snapshot of BONK / WIF / MEW / POPCAT holdings. Empty until the snapshot is loaded. Live balances are checked separately and must not be treated as 2023 history.",
+  "minRaw": {
+    "BONK": "1000000000",
+    "WIF": "1000000",
+    "MEW": "100000000",
+    "POPCAT": "1000000000"
+  },
+  "wallets": {}
+}
