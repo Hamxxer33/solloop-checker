@@ -120,6 +120,13 @@ export const TASKS: Task[] = [
     enabled: true,
   },
   {
+    id: "x-post-2097248329981997550",
+    label: "Like, comment, repost, and turn on notifications for this X post",
+    url: "https://x.com/Solloop/status/2097248329981997550",
+    required: true,
+    enabled: true,
+  },
+  {
     id: "tg",
     label: "Join Telegram",
     url: "https://t.me/solloopdotfun",
