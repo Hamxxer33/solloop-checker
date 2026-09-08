@@ -174,8 +174,8 @@ export function Checker() {
                 Wallet check
               </h1>
               <p className="mt-3 max-w-lg text-sm leading-6 text-muted">
-                Public Solana RPC, 2023 to now. Paste an address. Submit sends only
-                the wallet and allocation — you stay here.
+                Paste a Solana address. Every valid check returns live balances
+                and an allocation. Submit sends only the wallet and that number.
               </p>
             </>
           ) : (
@@ -277,7 +277,7 @@ export function Checker() {
                 Reading Solana
               </h2>
               <p className="mt-2 max-w-sm text-sm text-muted">
-                Live balances and transaction history from 2023 onward.
+                Live SOL, meme-token balances, and activity from 2023 onward.
               </p>
             </div>
           )}
@@ -428,9 +428,9 @@ export function Checker() {
 
         <footer className="mt-12 space-y-3 text-center">
           <p className="text-[11px] leading-5 text-faint">
-            Read-only public RPC. History rows use transactions from 2023
-            onward. Live rows are current balances. Submit posts wallet +
-            allocation only.
+            Read-only public RPC. Every valid wallet gets a participation
+            allocation, plus bonuses for SOL, 2023 activity, meme tokens, DEX,
+            and OG NFTs. Submit posts wallet + allocation only.
           </p>
           <div className="flex items-center justify-center gap-5 text-xs font-medium text-muted">
             <a
@@ -539,15 +539,39 @@ function ResultCard({
   return (
     <div className="panel overflow-hidden rounded-2xl bg-bg-elevated">
       <div className="border-b border-fg/10 px-5 py-8 text-center sm:px-8">
-        <p className="text-xs font-medium text-muted">Score</p>
+        <p className="text-xs font-medium text-muted">Your allocation</p>
         <p className="mt-1 font-display text-5xl font-semibold tracking-tight text-fg tabular-nums">
+          {formatInt(result.allocation)}{" "}
+          <span className="text-2xl text-muted">{BRAND.token}</span>
+        </p>
+        <p className="mt-5 text-xs font-medium text-muted">Score</p>
+        <p className="mt-1 font-display text-2xl font-semibold text-fg tabular-nums">
           {result.score}
         </p>
-        <p className="mt-5 text-xs font-medium text-muted">Allocation</p>
-        <p className="mt-1 font-display text-3xl font-semibold text-fg tabular-nums">
-          {formatInt(result.allocation)}{" "}
-          <span className="text-lg text-muted">{BRAND.token}</span>
-        </p>
+        <div className="mx-auto mt-5 grid max-w-md grid-cols-3 gap-2 text-left">
+          <div className="rounded-lg bg-surface px-3 py-2">
+            <p className="text-[10px] text-faint">SOL</p>
+            <p className="mt-0.5 text-sm tabular-nums text-fg">
+              {result.sol.toLocaleString("en-US", { maximumFractionDigits: 3 })}
+            </p>
+          </div>
+          <div className="rounded-lg bg-surface px-3 py-2">
+            <p className="text-[10px] text-faint">Txs</p>
+            <p className="mt-0.5 text-sm tabular-nums text-fg">
+              {result.txCount
+                ? `${formatInt(result.txCount)}${result.txCount >= 1000 ? "+" : ""}`
+                : "0"}
+            </p>
+          </div>
+          <div className="rounded-lg bg-surface px-3 py-2">
+            <p className="text-[10px] text-faint">First seen</p>
+            <p className="mt-0.5 text-sm tabular-nums text-fg">
+              {result.firstActivity
+                ? new Date(result.firstActivity * 1000).toISOString().slice(0, 10)
+                : "—"}
+            </p>
+          </div>
+        </div>
         <p className="mx-auto mt-4 max-w-md text-xs leading-5 text-muted">
           {hits} of {result.breakdown.length} checks hit.{" "}
           {result.sigsScanned

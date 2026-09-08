@@ -5,6 +5,8 @@ import {
   POINTS,
   PROGRAMS,
   RPC_ENDPOINTS,
+  TOKEN_2022_PROGRAM,
+  TOKEN_PROGRAM,
   TOKENS,
   YEAR_2024_TS,
   computeAllocation,
@@ -14,33 +16,31 @@ import type { BreakdownRow, WalletCheckResult } from "@/lib/types";
 
 type RpcResult<T> = { result?: T; error?: { message?: string } };
 
-async function rpc<T>(method: string, params: unknown[], timeoutMs = 8_000): Promise<T> {
+const RPC_TIMEOUT_MS = 3_200;
+const HARD_DEADLINE_MS = 7_200;
+
+async function rpcOnce<T>(url: string, method: string, params: unknown[], timeoutMs: number): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": "Mozilla/5.0 (compatible; SOLLOOP-checker/1.0)",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`RPC ${res.status}`);
+  const json = (await res.json()) as RpcResult<T>;
+  if (json.error) throw new Error(json.error.message ?? "RPC error");
+  if (json.result === undefined) throw new Error("Empty RPC result");
+  return json.result;
+}
+
+async function rpc<T>(method: string, params: unknown[], timeoutMs = RPC_TIMEOUT_MS): Promise<T> {
   let lastError = "RPC failed";
   for (const url of RPC_ENDPOINTS) {
     try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "user-agent": "Mozilla/5.0 (compatible; SOLLOOP-checker/1.0)",
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (!res.ok) {
-        lastError = `RPC ${res.status}`;
-        continue;
-      }
-      const json = (await res.json()) as RpcResult<T>;
-      if (json.error) {
-        lastError = json.error.message ?? "RPC error";
-        continue;
-      }
-      if (json.result === undefined) {
-        lastError = "Empty RPC result";
-        continue;
-      }
-      return json.result;
+      return await rpcOnce<T>(url, method, params, timeoutMs);
     } catch (err) {
       lastError = err instanceof Error ? err.message : "RPC failed";
     }
@@ -53,7 +53,7 @@ type TokenAccount = {
   pubkey?: string;
   account?: {
     data?: {
-      parsed?: { info?: { tokenAmount?: TokenAmount } };
+      parsed?: { info?: { mint?: string; tokenAmount?: TokenAmount } };
     };
   };
 };
@@ -64,11 +64,6 @@ type Signature = {
 };
 
 type ParsedIx = { programId?: string };
-type TokenBal = {
-  mint?: string;
-  owner?: string;
-  uiTokenAmount?: { uiAmount?: number | null; amount?: string };
-};
 type TxJson = {
   blockTime?: number | null;
   transaction?: {
@@ -78,8 +73,6 @@ type TxJson = {
     };
   };
   meta?: {
-    preTokenBalances?: TokenBal[];
-    postTokenBalances?: TokenBal[];
     innerInstructions?: Array<{ instructions?: ParsedIx[] }>;
   };
 };
@@ -103,52 +96,17 @@ function formatDay(ts: number): string {
   return new Date(ts * 1000).toISOString().slice(0, 10);
 }
 
-async function mapLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let i = 0;
-  async function worker() {
-    while (i < items.length) {
-      const idx = i++;
-      out[idx] = await fn(items[idx]);
-    }
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(limit, Math.max(items.length, 1)) }, () =>
-      worker(),
-    ),
-  );
-  return out;
+function lamportsToSol(lamports: number): number {
+  return lamports / 1_000_000_000;
 }
 
-async function tokenAccounts(wallet: string, mint: string) {
-  const result = await rpc<{ value?: TokenAccount[] }>(
-    "getTokenAccountsByOwner",
-    [wallet, { mint }, { encoding: "jsonParsed" }],
-  );
-  let raw = 0n;
-  let ui = 0;
-  const pubkeys: string[] = [];
-  for (const acc of result.value ?? []) {
-    if (acc.pubkey) pubkeys.push(acc.pubkey);
-    const ta = acc.account?.data?.parsed?.info?.tokenAmount;
-    if (!ta) continue;
-    raw += BigInt(ta.amount ?? "0");
-    ui += typeof ta.uiAmount === "number" ? ta.uiAmount : 0;
+function parseBalance(result: unknown): number {
+  if (typeof result === "number") return result;
+  if (result && typeof result === "object" && "value" in result) {
+    const value = (result as { value: unknown }).value;
+    if (typeof value === "number") return value;
   }
-  return { raw, ui, pubkeys };
-}
-
-async function signaturesFor(
-  address: string,
-  opts: { limit: number; before?: string },
-): Promise<Signature[]> {
-  const params: Record<string, unknown> = { limit: opts.limit };
-  if (opts.before) params.before = opts.before;
-  return rpc<Signature[]>("getSignaturesForAddress", [address, params]);
+  return 0;
 }
 
 const JUP = new Set<string>(PROGRAMS.jupiter);
@@ -173,122 +131,58 @@ function collectProgramIds(tx: TxJson): Set<string> {
   return ids;
 }
 
-type TokenHist = { maxUi: number; firstTs: number | null; inWindow: boolean };
-
-function emptyHist(): Record<string, TokenHist> {
-  const out: Record<string, TokenHist> = {};
-  for (const t of TOKENS) out[t.id] = { maxUi: 0, firstTs: null, inWindow: false };
-  return out;
+async function signaturesFor(address: string, limit: number): Promise<Signature[]> {
+  return rpc<Signature[]>("getSignaturesForAddress", [address, { limit }]);
 }
 
-function noteToken(
-  hist: Record<string, TokenHist>,
-  mint: string,
-  ui: number,
-  ts: number | null,
-) {
-  const token = MINT_BY.get(mint);
-  if (!token || ui <= 0) return;
-  const row = hist[token.id];
-  if (ui > row.maxUi) row.maxUi = ui;
-  if (ts && (row.firstTs === null || ts < row.firstTs)) row.firstTs = ts;
-  if (ts && ts >= HISTORY_START_TS && ts < YEAR_2024_TS) row.inWindow = true;
-  if (ts && ts < YEAR_2024_TS) row.inWindow = true;
-}
-
-function ingestTx(
-  tx: TxJson,
-  wallet: string,
-  hist: Record<string, TokenHist>,
-  dex: { jup: boolean; ray: boolean },
-) {
-  const ts = tx.blockTime ?? null;
-  const bals = [
-    ...(tx.meta?.preTokenBalances ?? []),
-    ...(tx.meta?.postTokenBalances ?? []),
-  ];
-  for (const bal of bals) {
-    if (bal.owner && bal.owner !== wallet) continue;
-    const ui = bal.uiTokenAmount?.uiAmount;
-    if (typeof ui === "number" && bal.mint) noteToken(hist, bal.mint, ui, ts);
-  }
-  const ids = collectProgramIds(tx);
-  for (const id of ids) {
-    if (JUP.has(id)) dex.jup = true;
-    if (RAY.has(id)) dex.ray = true;
-  }
-}
-
-async function fetchTx(signature: string): Promise<TxJson | null> {
+async function oldestSignatureTime(address: string, deadline: number): Promise<number | null> {
+  if (Date.now() > deadline) return null;
   try {
-    return await rpc<TxJson | null>(
-      "getTransaction",
-      [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }],
-      8_000,
-    );
+    const batch = await signaturesFor(address, 1000);
+    if (!batch.length) return null;
+    const times = batch
+      .map((s) => s.blockTime)
+      .filter((t): t is number => typeof t === "number");
+    if (!times.length) return null;
+    if (batch.length < 1000) return Math.min(...times);
+    return Math.min(...times);
   } catch {
     return null;
   }
 }
 
-async function scanAddressHistory(
-  address: string,
-  maxPages: number,
-  deadline: number,
-): Promise<{ sigs: Signature[]; exhausted: boolean }> {
-  const sigs: Signature[] = [];
-  let before: string | undefined;
-  let exhausted = false;
-  for (let page = 0; page < maxPages; page++) {
-    if (Date.now() > deadline) break;
-    let batch: Signature[] = [];
-    try {
-      batch = await signaturesFor(address, { limit: 1000, before });
-    } catch {
-      break;
-    }
-    if (!batch.length) {
-      exhausted = true;
-      break;
-    }
-    sigs.push(...batch);
-    const oldest = batch[batch.length - 1]?.blockTime ?? 0;
-    if (oldest && oldest < HISTORY_START_TS) {
-      exhausted = true;
-      break;
-    }
-    if (batch.length < 1000) {
-      exhausted = true;
-      break;
-    }
-    before = batch[batch.length - 1]?.signature;
-    if (!before) break;
-  }
-  return { sigs, exhausted };
-}
+type LiveToken = { ui: number; raw: bigint; pubkey: string | null };
 
-function pickSample(sigs: Signature[], max: number): string[] {
-  if (!sigs.length) return [];
-  const wanted: Signature[] = [];
-  const inWindow = sigs.filter(
-    (s) =>
-      typeof s.blockTime === "number" &&
-      s.blockTime >= HISTORY_START_TS &&
-      s.blockTime < YEAR_2024_TS,
-  );
-  const step = Math.max(1, Math.floor(inWindow.length / 10));
-  for (let i = 0; i < inWindow.length && wanted.length < 12; i += step) {
-    wanted.push(inWindow[i]);
+async function loadTokenAccounts(wallet: string): Promise<Record<string, LiveToken>> {
+  const empty = (): LiveToken => ({ ui: 0, raw: 0n, pubkey: null });
+  const out: Record<string, LiveToken> = {};
+  for (const t of TOKENS) out[t.id] = empty();
+
+  async function ingest(programId: string) {
+    const result = await rpc<{ value?: TokenAccount[] }>("getTokenAccountsByOwner", [
+      wallet,
+      { programId },
+      { encoding: "jsonParsed" },
+    ]);
+    for (const acc of result.value ?? []) {
+      const info = acc.account?.data?.parsed?.info;
+      const mint = info?.mint;
+      if (!mint) continue;
+      const token = MINT_BY.get(mint);
+      if (!token) continue;
+      const ta = info?.tokenAmount;
+      const raw = BigInt(ta?.amount ?? "0");
+      const ui = typeof ta?.uiAmount === "number" ? ta.uiAmount : 0;
+      const row = out[token.id];
+      row.raw += raw;
+      row.ui += ui;
+      if (!row.pubkey && acc.pubkey) row.pubkey = acc.pubkey;
+    }
   }
-  wanted.push(...sigs.slice(0, 4));
-  wanted.push(...sigs.slice(-8));
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const s of wanted) {
-    if (!s.signature || seen.has(s.signature)) continue;
-    seen.add(s.signature);
-    out.push(s.signature);
-    if (out.length >= max) break;
+
+  const results = await Promise.allSettled([ingest(TOKEN_PROGRAM), ingest(TOKEN_2022_PROGRAM)]);
+  if (results.every((r) => r.status === "rejected")) {
+    throw new Error("Could not read token accounts");
   }
   return out;
 }
@@ -308,7 +202,7 @@ async function fetchNfts(wallet: string): Promise<MeToken[] | null> {
         accept: "application/json",
         "user-agent": "Mozilla/5.0 (compatible; SOLLOOP-checker/1.0)",
       },
-      signal: AbortSignal.timeout(8_000),
+      signal: AbortSignal.timeout(4_000),
     });
     if (!res.ok) return null;
     const json = (await res.json()) as unknown;
@@ -326,89 +220,122 @@ function nftHit(tokens: MeToken[], match: string[]): boolean {
   });
 }
 
-async function runCheck(wallet: string): Promise<WalletCheckResult> {
-  const deadline = Date.now() + 11_000;
-  const hist = emptyHist();
+async function detectDex(sigs: Signature[], deadline: number): Promise<{ jup: boolean; ray: boolean }> {
   const dex = { jup: false, ray: false };
-
-  const [liveBalances, nfts, walletScan] = await Promise.all([
-    Promise.all(
-      TOKENS.map(async (token) => {
-        try {
-          const acc = await tokenAccounts(wallet, token.mint);
-          return { token, acc, error: null as string | null };
-        } catch (err) {
-          return {
-            token,
-            acc: { raw: 0n, ui: 0, pubkeys: [] as string[] },
-            error: err instanceof Error ? err.message : "RPC error",
-          };
-        }
-      }),
-    ),
-    fetchNfts(wallet),
-    scanAddressHistory(wallet, 3, deadline),
-  ]);
-
-  const ataPubs = liveBalances.flatMap((row) =>
-    row.acc.pubkeys.map((pk) => ({ pk, tokenId: row.token.id, mint: row.token.mint })),
-  );
-
-  const ataScans = await Promise.all(
-    ataPubs.map(async ({ pk }) => {
-      try {
-        return await scanAddressHistory(pk, 2, deadline);
-      } catch {
-        return { sigs: [] as Signature[], exhausted: false };
+  const sample = sigs.slice(0, 4).map((s) => s.signature).filter((s): s is string => Boolean(s));
+  for (const signature of sample) {
+    if (Date.now() > deadline) break;
+    try {
+      const tx = await rpc<TxJson | null>(
+        "getTransaction",
+        [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }],
+        2_800,
+      );
+      if (!tx) continue;
+      const ids = collectProgramIds(tx);
+      for (const id of ids) {
+        if (JUP.has(id)) dex.jup = true;
+        if (RAY.has(id)) dex.ray = true;
       }
-    }),
-  );
-
-  for (let i = 0; i < ataPubs.length; i++) {
-    const { mint } = ataPubs[i];
-    const scan = ataScans[i];
-    const oldest = scan.sigs[scan.sigs.length - 1];
-    const ts = oldest?.blockTime ?? null;
-    const live = liveBalances.find((r) => r.token.mint === mint);
-    if (live && live.acc.ui > 0) {
-      noteToken(hist, mint, live.acc.ui, ts);
-    }
-    if (ts && ts < YEAR_2024_TS) {
-      noteToken(hist, mint, Math.max(live?.acc.ui ?? 0, 1), ts);
+      if (dex.jup && dex.ray) break;
+    } catch {
+      /* skip */
     }
   }
+  return dex;
+}
 
-  const sampleSigs = pickSample(walletScan.sigs, 20);
-  const txs = await mapLimit(sampleSigs, 5, fetchTx);
-  for (const tx of txs) {
-    if (tx) ingestTx(tx, wallet, hist, dex);
-  }
+function emptyResult(wallet: string, extra?: Partial<WalletCheckResult>): WalletCheckResult {
+  const breakdown: BreakdownRow[] = [
+    {
+      id: "check",
+      label: "Wallet checked",
+      kind: "activity",
+      hit: true,
+      points: POINTS.participate,
+      detail: "Valid Solana address — participation allocation",
+    },
+  ];
+  const score = POINTS.participate;
+  return {
+    wallet,
+    score,
+    allocation: computeAllocation(score),
+    breakdown,
+    checkedAt: new Date().toISOString(),
+    firstActivity: null,
+    scannedTo: null,
+    sigsScanned: 0,
+    sol: 0,
+    txCount: 0,
+    ...extra,
+  };
+}
 
-  const ataOldestSigs = ataScans
-    .map((s) => s.sigs[s.sigs.length - 1]?.signature)
-    .filter((s): s is string => Boolean(s))
-    .slice(0, 8);
-  const ataTxs = await mapLimit(ataOldestSigs, 4, fetchTx);
-  for (const tx of ataTxs) {
-    if (tx) ingestTx(tx, wallet, hist, dex);
-  }
-
-  const times = walletScan.sigs
-    .map((s) => s.blockTime)
-    .filter((t): t is number => typeof t === "number");
-  const firstActivity = times.length ? Math.min(...times) : null;
-  const scannedTo = times.length ? Math.min(...times) : null;
-  const reachedGenesis = walletScan.exhausted;
-
+async function runCheck(wallet: string): Promise<WalletCheckResult> {
+  const deadline = Date.now() + HARD_DEADLINE_MS;
   const breakdown: BreakdownRow[] = [];
 
-  const tokenSeen2023 = TOKENS.some((t) => {
-    const ts = hist[t.id].firstTs;
-    return ts !== null && ts < YEAR_2024_TS;
+  breakdown.push({
+    id: "check",
+    label: "Wallet checked",
+    kind: "activity",
+    hit: true,
+    points: POINTS.participate,
+    detail: "Valid Solana address — participation allocation",
   });
-  const confirmed2023 =
-    tokenSeen2023 || (firstActivity !== null && firstActivity < YEAR_2024_TS);
-  const unknown2023 = !reachedGenesis && !confirmed2023;
+
+  const [balanceRes, tokenRes, sigRes, nftRes] = await Promise.allSettled([
+    rpc<unknown>("getBalance", [wallet]),
+    loadTokenAccounts(wallet),
+    signaturesFor(wallet, 1000),
+    fetchNfts(wallet),
+  ]);
+
+  const lamports = balanceRes.status === "fulfilled" ? parseBalance(balanceRes.value) : 0;
+  const sol = lamportsToSol(lamports);
+  const liveTokens = tokenRes.status === "fulfilled" ? tokenRes.value : null;
+  const tokenError = tokenRes.status === "rejected";
+  const sigs = sigRes.status === "fulfilled" ? sigRes.value : [];
+  const nfts = nftRes.status === "fulfilled" ? nftRes.value : null;
+
+  const times = sigs
+    .map((s) => s.blockTime)
+    .filter((t): t is number => typeof t === "number");
+  const oldestOnPage = times.length ? Math.min(...times) : null;
+  const reachedGenesis = sigs.length > 0 && sigs.length < 1000;
+  const firstActivity = oldestOnPage;
+  const confirmed2023 = oldestOnPage !== null && oldestOnPage < YEAR_2024_TS;
+  const unknown2023 = !reachedGenesis && !confirmed2023 && sigs.length > 0;
+
+  const hasActivity = sigs.length > 0 || sol > 0 || Boolean(liveTokens && Object.values(liveTokens).some((t) => t.ui > 0));
+  breakdown.push({
+    id: "active-wallet",
+    label: "On-chain wallet",
+    kind: "activity",
+    hit: hasActivity,
+    points: hasActivity ? POINTS.activeWallet : 0,
+    detail: hasActivity
+      ? `${sigs.length ? `${sigs.length}${reachedGenesis ? "" : "+"} txs` : "balances"} on Solana`
+      : "No transactions or balances found",
+  });
+
+  const solHit = sol > 0;
+  breakdown.push({
+    id: "sol",
+    label: "SOL balance",
+    kind: "live",
+    hit: solHit,
+    points: solHit ? POINTS.sol : 0,
+    unavailable: balanceRes.status === "rejected",
+    detail:
+      balanceRes.status === "rejected"
+        ? "Could not read SOL"
+        : solHit
+          ? `${sol.toLocaleString("en-US", { maximumFractionDigits: 4 })} SOL`
+          : "0 SOL",
+  });
+
   breakdown.push({
     id: "active-2023",
     label: "On-chain in 2023",
@@ -417,42 +344,59 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     points: confirmed2023 ? POINTS.active2023 : 0,
     unavailable: unknown2023,
     detail: confirmed2023
-      ? `Activity on or before ${formatDay(
-          Math.min(
-            ...[firstActivity, ...TOKENS.map((t) => hist[t.id].firstTs)].filter(
-              (t): t is number => t !== null && t < YEAR_2024_TS,
-            ),
-          ),
-        )}`
+      ? `Activity on or before ${formatDay(oldestOnPage!)}`
       : unknown2023
-        ? `Scanned back to ${scannedTo ? formatDay(scannedTo) : "recent"} — wallet is too busy to reach 2023 this pass`
+        ? `Scanned back to ${oldestOnPage ? formatDay(oldestOnPage) : "recent"} — wallet is too busy to reach 2023 this pass`
         : firstActivity
           ? `First activity ${formatDay(firstActivity)} (after 2023)`
           : "No signatures found",
   });
 
+  const ataOldest: Record<string, number | null> = {};
+  if (liveTokens && Date.now() < deadline) {
+    const atas = TOKENS.map((t) => liveTokens[t.id]?.pubkey).filter((pk): pk is string => Boolean(pk));
+    const remaining = Math.max(400, deadline - Date.now());
+    const per = Math.floor(remaining / Math.max(atas.length, 1));
+    await Promise.all(
+      TOKENS.map(async (token) => {
+        const pk = liveTokens[token.id]?.pubkey;
+        if (!pk) {
+          ataOldest[token.id] = null;
+          return;
+        }
+        if (Date.now() > deadline) {
+          ataOldest[token.id] = null;
+          return;
+        }
+        const ts = await oldestSignatureTime(pk, Date.now() + Math.min(per, 2_400));
+        ataOldest[token.id] = ts;
+      }),
+    );
+  }
+
   for (const token of TOKENS) {
-    const h = hist[token.id];
-    const minUi = token.minUi;
-    const hit = h.inWindow || (h.firstTs !== null && h.firstTs < YEAR_2024_TS && h.maxUi >= minUi);
+    const live = liveTokens?.[token.id];
+    const oldest = ataOldest[token.id] ?? null;
+    const heldNow = (live?.ui ?? 0) > 0;
+    const from2023 = oldest !== null && oldest < YEAR_2024_TS;
+    const histHit = from2023;
     breakdown.push({
       id: `hist-${token.id}`,
       label: `${token.symbol} since 2023`,
       kind: "history",
-      hit,
-      points: hit ? POINTS.historyToken : 0,
-      detail: hit
-        ? h.firstTs
-          ? `Held ${formatUi(h.maxUi, token.symbol)} · first seen ${formatDay(h.firstTs)}`
-          : `Held ${formatUi(h.maxUi, token.symbol)} in history`
-        : h.maxUi > 0
-          ? `${formatUi(h.maxUi, token.symbol)} seen after 2023`
-          : "No 2023 hold in scanned history",
+      hit: histHit,
+      points: histHit ? POINTS.historyToken : 0,
+      detail:
+        histHit
+          ? `${heldNow && live ? `Held ${formatUi(live.ui, token.symbol)}` : "Token account"} · first ${oldest ? formatDay(oldest) : "2023"}`
+          : live && live.ui > 0
+            ? `${formatUi(live.ui, token.symbol)} — no 2023 ATA history this pass`
+            : "No 2023 hold in scanned history",
     });
   }
 
-  for (const { token, acc, error } of liveBalances) {
-    if (error) {
+  for (const token of TOKENS) {
+    if (tokenError || !liveTokens) {
       breakdown.push({
         id: `live-${token.id}`,
         label: `${token.symbol} now`,
@@ -464,6 +408,7 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
       });
       continue;
     }
+    const acc = liveTokens[token.id];
     const hit = acc.ui >= token.minUi && acc.raw > 0n;
     breakdown.push({
       id: `live-${token.id}`,
@@ -479,6 +424,10 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     });
   }
 
+  const dex =
+    sigs.length && Date.now() < deadline
+      ? await detectDex(sigs, deadline)
+      : { jup: false, ray: false };
   const dexHit = dex.jup || dex.ray;
   breakdown.push({
     id: "dex",
@@ -487,9 +436,9 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     hit: dexHit,
     points: dexHit ? POINTS.dexActivity : 0,
     detail: dexHit
-      ? `${[dex.jup ? "Jupiter" : null, dex.ray ? "Raydium" : null].filter(Boolean).join(" + ")} in scanned txs`
-      : walletScan.sigs.length
-        ? `No Jup/Raydium in ${sampleSigs.length} sampled txs`
+      ? `${[dex.jup ? "Jupiter" : null, dex.ray ? "Raydium" : null].filter(Boolean).join(" + ")} in recent txs`
+      : sigs.length
+        ? "No Jup/Raydium in recent sampled txs"
         : "No transactions",
   });
 
@@ -525,8 +474,10 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     breakdown,
     checkedAt: new Date().toISOString(),
     firstActivity,
-    scannedTo,
-    sigsScanned: walletScan.sigs.length,
+    scannedTo: oldestOnPage,
+    sigsScanned: sigs.length,
+    sol,
+    txCount: sigs.length,
   };
 }
 
@@ -539,5 +490,9 @@ export const checkWallet = createServerFn({ method: "POST" })
     return { address };
   })
   .handler(async ({ data }) => {
-    return runCheck(data.address);
+    try {
+      return await runCheck(data.address);
+    } catch {
+      return emptyResult(data.address);
+    }
   });

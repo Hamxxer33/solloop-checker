@@ -12,8 +12,11 @@ export const BRAND = {
   telegram: "https://t.me/solloopdotfun",
 } as const;
 
-/** Allocation = score * ALLOCATION_MULTIPLIER. This is the number posted to the form. */
-export const ALLOCATION_MULTIPLIER = 17;
+/**
+ * Allocation = score * ALLOCATION_MULTIPLIER.
+ * Every valid check includes POINTS.participate, so nobody lands on 0.
+ */
+export const ALLOCATION_MULTIPLIER = 50;
 
 export const HISTORY_START_TS = Date.UTC(2023, 0, 1) / 1000;
 export const YEAR_2024_TS = Date.UTC(2024, 0, 1) / 1000;
@@ -134,9 +137,12 @@ export const TASKS: Task[] = [
 ];
 
 export const POINTS = {
+  participate: 20,
+  activeWallet: 10,
+  sol: 6,
   historyToken: 12,
-  liveToken: 8,
-  active2023: 10,
+  liveToken: 10,
+  active2023: 16,
   dexActivity: 10,
   nft: 14,
 } as const;
@@ -222,8 +228,11 @@ export const PROGRAMS = {
 } as const;
 
 export const RPC_ENDPOINTS = [
-  "https://api.mainnet-beta.solana.com",
   "https://solana-rpc.publicnode.com",
+  "https://api.mainnet-beta.solana.com",
+  "https://rpc.ankr.com/solana",
+  "https://solana.drpc.org",
+  "https://1rpc.io/solana",
 ] as const;
 
 export const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";

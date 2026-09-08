@@ -19,4 +19,6 @@ export type WalletCheckResult = {
   firstActivity: number | null;
   scannedTo: number | null;
   sigsScanned: number;
+  sol: number;
+  txCount: number;
 };
