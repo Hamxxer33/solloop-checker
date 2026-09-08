@@ -217,15 +217,44 @@ export const PROGRAMS = {
   jupiter: [
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
     "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33Wc4uB",
+    "JUP3c2Uh3WA4Ng34tw6kPd2G4C5BB21Xo36Je1s32Ph",
     "JUP2jxvXaqu7NQY1GmNF4m1vodw12LVXYxbFL3drEZ",
+    "JUP6i4ozu5ydDCnLiMogSckDPpbtr7BJ4FtzYWkb5Rk",
+    "jupoNjAxXgZ4rjzxzPMP4oxduvQsQtZzyknqvnYVfi",
+    "DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M",
   ],
   raydium: [
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
     "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
     "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpjSHYWMBCNwRty",
     "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS",
+    "5quBtoiQqxF9Rv6ELyhS3zHYWWfNuN69K3NpvY1CAuzn",
+    "27haf8d6NwurcrE7y4hASfm5Rjb6XLwGFynpaU79iuK",
+    "RVKd61ztZW9GUwhRbbLoYVRE5Xf1B2tVscKqwZxX4kx",
+    "EhhTKczWMGQt46ynNeRX1WfeagwwJd7ufHvCDjRxjo5Q",
+  ],
+  serum: [
+    "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+    "EUqojwWA2rd19FZrzeBncJsm38Jm1hEhE3zuaXqspNj",
+    "BJ3jrUzddkjEa5NNqttrQPZJ7RwZchhYwqmAPRQ2gE8C",
+    "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",
+    "opnb2LAfJYbRMAHHvojrwgTiddYLK1t1WUfiTshA",
+    "EoTcMgcDRTJVZDMZWBoU6rhYHZfkNTVEAfz3uUJRcYGj",
+  ],
+  orca: [
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+    "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",
+    "DjVE6JNiYqPL2QXyCUUh8rNjHrbz9hXHNYt99MQ59qw1",
   ],
 } as const;
+
+/** Stable / OG mints used to date a wallet when recent txs hide 2021–2023 history. */
+export const AGE_MINTS: { id: string; symbol: string; mint: string }[] = [
+  { id: "usdc", symbol: "USDC", mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+  { id: "usdt", symbol: "USDT", mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" },
+  { id: "wsol", symbol: "WSOL", mint: "So11111111111111111111111111111111111111112" },
+  { id: "ray", symbol: "RAY", mint: "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R" },
+];
 
 export const RPC_ENDPOINTS = [
   "https://solana-rpc.publicnode.com",

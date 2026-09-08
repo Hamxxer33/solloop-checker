@@ -277,7 +277,8 @@ export function Checker() {
                 Reading Solana
               </h2>
               <p className="mt-2 max-w-sm text-sm text-muted">
-                Live SOL, meme-token balances, and activity from 2023 onward.
+                Live SOL, meme-token balances, and history back through 2021
+                (Serum, Raydium, Jupiter).
               </p>
             </div>
           )}
@@ -429,8 +430,9 @@ export function Checker() {
         <footer className="mt-12 space-y-3 text-center">
           <p className="text-[11px] leading-5 text-faint">
             Read-only public RPC. Every valid wallet gets a participation
-            allocation, plus bonuses for SOL, 2023 activity, meme tokens, DEX,
-            and OG NFTs. Submit posts wallet + allocation only.
+            allocation. Old wallets are dated from first on-chain activity and
+            token accounts, not just the last few swaps. DEX covers Jupiter,
+            Raydium, Serum, and Orca. Submit posts wallet + allocation only.
           </p>
           <div className="flex items-center justify-center gap-5 text-xs font-medium text-muted">
             <a

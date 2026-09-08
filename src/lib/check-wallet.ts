@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import {
+  AGE_MINTS,
   HISTORY_START_TS,
   NFTS,
   POINTS,
@@ -16,8 +17,8 @@ import type { BreakdownRow, WalletCheckResult } from "@/lib/types";
 
 type RpcResult<T> = { result?: T; error?: { message?: string } };
 
-const RPC_TIMEOUT_MS = 3_200;
-const HARD_DEADLINE_MS = 7_200;
+const RPC_TIMEOUT_MS = 2_800;
+const HARD_DEADLINE_MS = 8_200;
 
 async function rpcOnce<T>(url: string, method: string, params: unknown[], timeoutMs: number): Promise<T> {
   const res = await fetch(url, {
@@ -36,16 +37,28 @@ async function rpcOnce<T>(url: string, method: string, params: unknown[], timeou
   return json.result;
 }
 
-async function rpc<T>(method: string, params: unknown[], timeoutMs = RPC_TIMEOUT_MS): Promise<T> {
-  let lastError = "RPC failed";
-  for (const url of RPC_ENDPOINTS) {
-    try {
-      return await rpcOnce<T>(url, method, params, timeoutMs);
-    } catch (err) {
-      lastError = err instanceof Error ? err.message : "RPC failed";
-    }
+async function rpcBest<T>(
+  method: string,
+  params: unknown[],
+  timeoutMs = RPC_TIMEOUT_MS,
+  score: (value: T) => number = () => 1,
+): Promise<T> {
+  const settled = await Promise.allSettled(
+    RPC_ENDPOINTS.map((url) => rpcOnce<T>(url, method, params, timeoutMs)),
+  );
+  const ok = settled
+    .filter((row): row is PromiseFulfilledResult<T> => row.status === "fulfilled")
+    .map((row) => row.value);
+  if (!ok.length) {
+    const last = settled.find((row) => row.status === "rejected") as PromiseRejectedResult | undefined;
+    throw last?.reason instanceof Error ? last.reason : new Error("RPC failed");
   }
-  throw new Error(lastError);
+  ok.sort((a, b) => score(b) - score(a));
+  return ok[0];
+}
+
+async function rpc<T>(method: string, params: unknown[], timeoutMs = RPC_TIMEOUT_MS): Promise<T> {
+  return rpcBest<T>(method, params, timeoutMs);
 }
 
 type TokenAmount = { amount?: string; uiAmount?: number | null; decimals?: number };
@@ -74,6 +87,7 @@ type TxJson = {
   };
   meta?: {
     innerInstructions?: Array<{ instructions?: ParsedIx[] }>;
+    loadedAddresses?: { writable?: string[]; readonly?: string[] };
   };
 };
 
@@ -109,9 +123,17 @@ function parseBalance(result: unknown): number {
   return 0;
 }
 
+function minTime(times: Array<number | null | undefined>): number | null {
+  const ok = times.filter((t): t is number => typeof t === "number");
+  return ok.length ? Math.min(...ok) : null;
+}
+
 const JUP = new Set<string>(PROGRAMS.jupiter);
 const RAY = new Set<string>(PROGRAMS.raydium);
+const SERUM = new Set<string>(PROGRAMS.serum);
+const ORCA = new Set<string>(PROGRAMS.orca);
 const MINT_BY = new Map(TOKENS.map((t) => [t.mint, t]));
+const AGE_BY_MINT = new Map(AGE_MINTS.map((t) => [t.mint, t]));
 
 function collectProgramIds(tx: TxJson): Set<string> {
   const ids = new Set<string>();
@@ -128,24 +150,63 @@ function collectProgramIds(tx: TxJson): Set<string> {
       if (ix.programId) ids.add(ix.programId);
     }
   }
+  for (const key of tx.meta?.loadedAddresses?.writable ?? []) ids.add(key);
+  for (const key of tx.meta?.loadedAddresses?.readonly ?? []) ids.add(key);
   return ids;
 }
 
-async function signaturesFor(address: string, limit: number): Promise<Signature[]> {
-  return rpc<Signature[]>("getSignaturesForAddress", [address, { limit }]);
+async function signaturesFor(
+  address: string,
+  opts: { limit: number; before?: string },
+): Promise<Signature[]> {
+  const params: Record<string, unknown> = { limit: opts.limit };
+  if (opts.before) params.before = opts.before;
+  return rpcBest<Signature[]>(
+    "getSignaturesForAddress",
+    [address, params],
+    RPC_TIMEOUT_MS,
+    (value) => (Array.isArray(value) ? value.length : 0),
+  );
+}
+
+async function rewindHistory(
+  address: string,
+  firstPage: Signature[],
+  deadline: number,
+): Promise<{ sigs: Signature[]; exhausted: boolean }> {
+  const sigs = [...firstPage];
+  let exhausted = firstPage.length < 1000;
+  let before = firstPage[firstPage.length - 1]?.signature;
+  let pages = 1;
+  while (!exhausted && pages < 6 && Date.now() < deadline && before) {
+    const oldest = minTime(sigs.map((s) => s.blockTime));
+    if (oldest !== null && oldest < YEAR_2024_TS) break;
+    let batch: Signature[] = [];
+    try {
+      batch = await signaturesFor(address, { limit: 1000, before });
+    } catch {
+      break;
+    }
+    pages += 1;
+    if (!batch.length) {
+      exhausted = true;
+      break;
+    }
+    sigs.push(...batch);
+    if (batch.length < 1000) {
+      exhausted = true;
+      break;
+    }
+    before = batch[batch.length - 1]?.signature;
+  }
+  return { sigs, exhausted };
 }
 
 async function oldestSignatureTime(address: string, deadline: number): Promise<number | null> {
   if (Date.now() > deadline) return null;
   try {
-    const batch = await signaturesFor(address, 1000);
-    if (!batch.length) return null;
-    const times = batch
-      .map((s) => s.blockTime)
-      .filter((t): t is number => typeof t === "number");
-    if (!times.length) return null;
-    if (batch.length < 1000) return Math.min(...times);
-    return Math.min(...times);
+    const batch = await signaturesFor(address, { limit: 1000 });
+    return minTime(batch.map((s) => s.blockTime));
   } catch {
     return null;
   }
@@ -153,30 +214,42 @@ async function oldestSignatureTime(address: string, deadline: number): Promise<n
 
 type LiveToken = { ui: number; raw: bigint; pubkey: string | null };
 
-async function loadTokenAccounts(wallet: string): Promise<Record<string, LiveToken>> {
+async function loadTokenAccounts(wallet: string): Promise<{
+  live: Record<string, LiveToken>;
+  agePubkeys: string[];
+}> {
   const empty = (): LiveToken => ({ ui: 0, raw: 0n, pubkey: null });
-  const out: Record<string, LiveToken> = {};
-  for (const t of TOKENS) out[t.id] = empty();
+  const live: Record<string, LiveToken> = {};
+  for (const t of TOKENS) live[t.id] = empty();
+  const agePubkeys: string[] = [];
+  const seen = new Set<string>();
 
   async function ingest(programId: string) {
-    const result = await rpc<{ value?: TokenAccount[] }>("getTokenAccountsByOwner", [
-      wallet,
-      { programId },
-      { encoding: "jsonParsed" },
-    ]);
+    const result = await rpcBest<{ value?: TokenAccount[] }>(
+      "getTokenAccountsByOwner",
+      [wallet, { programId }, { encoding: "jsonParsed" }],
+      3_400,
+      (value) => value.value?.length ?? 0,
+    );
     for (const acc of result.value ?? []) {
       const info = acc.account?.data?.parsed?.info;
       const mint = info?.mint;
+      const pubkey = acc.pubkey;
       if (!mint) continue;
       const token = MINT_BY.get(mint);
-      if (!token) continue;
-      const ta = info?.tokenAmount;
-      const raw = BigInt(ta?.amount ?? "0");
-      const ui = typeof ta?.uiAmount === "number" ? ta.uiAmount : 0;
-      const row = out[token.id];
-      row.raw += raw;
-      row.ui += ui;
-      if (!row.pubkey && acc.pubkey) row.pubkey = acc.pubkey;
+      if (token) {
+        const ta = info?.tokenAmount;
+        const raw = BigInt(ta?.amount ?? "0");
+        const ui = typeof ta?.uiAmount === "number" ? ta.uiAmount : 0;
+        const row = live[token.id];
+        row.raw += raw;
+        row.ui += ui;
+        if (!row.pubkey && pubkey) row.pubkey = pubkey;
+      }
+      if (pubkey && (token || AGE_BY_MINT.has(mint)) && !seen.has(pubkey)) {
+        seen.add(pubkey);
+        agePubkeys.push(pubkey);
+      }
     }
   }
 
@@ -184,7 +257,7 @@ async function loadTokenAccounts(wallet: string): Promise<Record<string, LiveTok
   if (results.every((r) => r.status === "rejected")) {
     throw new Error("Could not read token accounts");
   }
-  return out;
+  return { live, agePubkeys: agePubkeys.slice(0, 8) };
 }
 
 type MeToken = {
@@ -220,32 +293,101 @@ function nftHit(tokens: MeToken[], match: string[]): boolean {
   });
 }
 
-async function detectDex(sigs: Signature[], deadline: number): Promise<{ jup: boolean; ray: boolean }> {
-  const dex = { jup: false, ray: false };
-  const sample = sigs.slice(0, 4).map((s) => s.signature).filter((s): s is string => Boolean(s));
-  for (const signature of sample) {
-    if (Date.now() > deadline) break;
-    try {
-      const tx = await rpc<TxJson | null>(
-        "getTransaction",
-        [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }],
-        2_800,
-      );
-      if (!tx) continue;
-      const ids = collectProgramIds(tx);
-      for (const id of ids) {
-        if (JUP.has(id)) dex.jup = true;
-        if (RAY.has(id)) dex.ray = true;
-      }
-      if (dex.jup && dex.ray) break;
-    } catch {
-      /* skip */
+function pickDexSamples(sigs: Signature[], max: number): string[] {
+  if (!sigs.length) return [];
+  const wanted: Signature[] = [];
+  wanted.push(...sigs.slice(0, 3));
+  wanted.push(...sigs.slice(-5));
+  const window = sigs.filter(
+    (s) =>
+      typeof s.blockTime === "number" &&
+      s.blockTime >= HISTORY_START_TS &&
+      s.blockTime < YEAR_2024_TS,
+  );
+  const step = Math.max(1, Math.floor(window.length / 6));
+  for (let i = 0; i < window.length && wanted.length < max + 4; i += step) {
+    wanted.push(window[i]);
+  }
+  if (sigs.length > 20) {
+    wanted.push(sigs[Math.floor(sigs.length / 2)]);
+    wanted.push(sigs[Math.floor(sigs.length * 0.75)]);
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of wanted) {
+    if (!s.signature || seen.has(s.signature)) continue;
+    seen.add(s.signature);
+    out.push(s.signature);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await fn(items[idx]);
     }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, Math.max(items.length, 1)) }, () => worker()));
+  return out;
+}
+
+async function fetchTx(signature: string): Promise<TxJson | null> {
+  try {
+    return await rpc<TxJson | null>(
+      "getTransaction",
+      [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }],
+      2_600,
+    );
+  } catch {
+    return null;
+  }
+}
+
+type DexHit = { jup: boolean; ray: boolean; serum: boolean; orca: boolean };
+
+function emptyDex(): DexHit {
+  return { jup: false, ray: false, serum: false, orca: false };
+}
+
+function noteDex(dex: DexHit, ids: Set<string>) {
+  for (const id of ids) {
+    if (JUP.has(id)) dex.jup = true;
+    if (RAY.has(id)) dex.ray = true;
+    if (SERUM.has(id)) dex.serum = true;
+    if (ORCA.has(id)) dex.orca = true;
+  }
+}
+
+async function detectDex(sigs: Signature[], deadline: number): Promise<DexHit> {
+  const dex = emptyDex();
+  const sample = pickDexSamples(sigs, 12);
+  const txs = await mapLimit(sample, 4, async (signature) => {
+    if (Date.now() > deadline) return null;
+    return fetchTx(signature);
+  });
+  for (const tx of txs) {
+    if (tx) noteDex(dex, collectProgramIds(tx));
   }
   return dex;
 }
 
-function emptyResult(wallet: string, extra?: Partial<WalletCheckResult>): WalletCheckResult {
+function dexNames(dex: DexHit): string {
+  return [
+    dex.jup ? "Jupiter" : null,
+    dex.ray ? "Raydium" : null,
+    dex.serum ? "Serum" : null,
+    dex.orca ? "Orca" : null,
+  ]
+    .filter(Boolean)
+    .join(" + ");
+}
+
+function emptyResult(wallet: string): WalletCheckResult {
   const breakdown: BreakdownRow[] = [
     {
       id: "check",
@@ -268,7 +410,6 @@ function emptyResult(wallet: string, extra?: Partial<WalletCheckResult>): Wallet
     sigsScanned: 0,
     sol: 0,
     txCount: 0,
-    ...extra,
   };
 }
 
@@ -286,29 +427,48 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
   });
 
   const [balanceRes, tokenRes, sigRes, nftRes] = await Promise.allSettled([
-    rpc<unknown>("getBalance", [wallet]),
+    rpcBest<unknown>("getBalance", [wallet], 2_800),
     loadTokenAccounts(wallet),
-    signaturesFor(wallet, 1000),
+    signaturesFor(wallet, { limit: 1000 }),
     fetchNfts(wallet),
   ]);
 
   const lamports = balanceRes.status === "fulfilled" ? parseBalance(balanceRes.value) : 0;
   const sol = lamportsToSol(lamports);
-  const liveTokens = tokenRes.status === "fulfilled" ? tokenRes.value : null;
+  const tokenPack = tokenRes.status === "fulfilled" ? tokenRes.value : null;
+  const liveTokens = tokenPack?.live ?? null;
   const tokenError = tokenRes.status === "rejected";
-  const sigs = sigRes.status === "fulfilled" ? sigRes.value : [];
+  const firstPage = sigRes.status === "fulfilled" ? sigRes.value : [];
   const nfts = nftRes.status === "fulfilled" ? nftRes.value : null;
+
+  const history =
+    firstPage.length && Date.now() < deadline
+      ? await rewindHistory(wallet, firstPage, deadline)
+      : { sigs: firstPage, exhausted: firstPage.length > 0 && firstPage.length < 1000 };
+
+  const sigs = history.sigs;
+  const reachedGenesis = history.exhausted;
+
+  let ataOldest: number | null = null;
+  if (tokenPack?.agePubkeys.length && Date.now() < deadline) {
+    const times = await Promise.all(
+      tokenPack.agePubkeys.map((pk) => oldestSignatureTime(pk, deadline)),
+    );
+    ataOldest = minTime(times);
+  }
 
   const times = sigs
     .map((s) => s.blockTime)
     .filter((t): t is number => typeof t === "number");
-  const oldestOnPage = times.length ? Math.min(...times) : null;
-  const reachedGenesis = sigs.length > 0 && sigs.length < 1000;
-  const firstActivity = oldestOnPage;
-  const confirmed2023 = oldestOnPage !== null && oldestOnPage < YEAR_2024_TS;
+  const oldestOnPage = minTime(times);
+  const firstActivity = minTime([oldestOnPage, ataOldest]);
+  const confirmed2023 = firstActivity !== null && firstActivity < YEAR_2024_TS;
   const unknown2023 = !reachedGenesis && !confirmed2023 && sigs.length > 0;
 
-  const hasActivity = sigs.length > 0 || sol > 0 || Boolean(liveTokens && Object.values(liveTokens).some((t) => t.ui > 0));
+  const hasActivity =
+    sigs.length > 0 ||
+    sol > 0 ||
+    Boolean(liveTokens && Object.values(liveTokens).some((t) => t.ui > 0));
   breakdown.push({
     id: "active-wallet",
     label: "On-chain wallet",
@@ -338,60 +498,50 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
 
   breakdown.push({
     id: "active-2023",
-    label: "On-chain in 2023",
+    label: "On-chain in 2023 or earlier",
     kind: "history",
     hit: confirmed2023,
     points: confirmed2023 ? POINTS.active2023 : 0,
     unavailable: unknown2023,
     detail: confirmed2023
-      ? `Activity on or before ${formatDay(oldestOnPage!)}`
+      ? `First seen ${formatDay(firstActivity!)}`
       : unknown2023
-        ? `Scanned back to ${oldestOnPage ? formatDay(oldestOnPage) : "recent"} — wallet is too busy to reach 2023 this pass`
+        ? `Scanned back to ${oldestOnPage ? formatDay(oldestOnPage) : "recent"} — still paging history`
         : firstActivity
           ? `First activity ${formatDay(firstActivity)} (after 2023)`
           : "No signatures found",
   });
 
-  const ataOldest: Record<string, number | null> = {};
+  const tokenAtaOldest: Record<string, number | null> = {};
   if (liveTokens && Date.now() < deadline) {
-    const atas = TOKENS.map((t) => liveTokens[t.id]?.pubkey).filter((pk): pk is string => Boolean(pk));
-    const remaining = Math.max(400, deadline - Date.now());
-    const per = Math.floor(remaining / Math.max(atas.length, 1));
     await Promise.all(
       TOKENS.map(async (token) => {
         const pk = liveTokens[token.id]?.pubkey;
-        if (!pk) {
-          ataOldest[token.id] = null;
+        if (!pk || Date.now() > deadline) {
+          tokenAtaOldest[token.id] = null;
           return;
         }
-        if (Date.now() > deadline) {
-          ataOldest[token.id] = null;
-          return;
-        }
-        const ts = await oldestSignatureTime(pk, Date.now() + Math.min(per, 2_400));
-        ataOldest[token.id] = ts;
+        tokenAtaOldest[token.id] = await oldestSignatureTime(pk, deadline);
       }),
     );
   }
 
   for (const token of TOKENS) {
     const live = liveTokens?.[token.id];
-    const oldest = ataOldest[token.id] ?? null;
+    const oldest = tokenAtaOldest[token.id] ?? null;
     const heldNow = (live?.ui ?? 0) > 0;
     const from2023 = oldest !== null && oldest < YEAR_2024_TS;
-    const histHit = from2023;
     breakdown.push({
       id: `hist-${token.id}`,
       label: `${token.symbol} since 2023`,
       kind: "history",
-      hit: histHit,
-      points: histHit ? POINTS.historyToken : 0,
-      detail:
-        histHit
-          ? `${heldNow && live ? `Held ${formatUi(live.ui, token.symbol)}` : "Token account"} · first ${oldest ? formatDay(oldest) : "2023"}`
-          : live && live.ui > 0
-            ? `${formatUi(live.ui, token.symbol)} — no 2023 ATA history this pass`
-            : "No 2023 hold in scanned history",
+      hit: from2023,
+      points: from2023 ? POINTS.historyToken : 0,
+      detail: from2023
+        ? `${heldNow && live ? `Held ${formatUi(live.ui, token.symbol)}` : "Token account"} · first ${oldest ? formatDay(oldest) : "2023"}`
+        : live && live.ui > 0
+          ? `${formatUi(live.ui, token.symbol)} — no 2023 ATA history this pass`
+          : "No 2023 hold in scanned history",
     });
   }
 
@@ -425,20 +575,18 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
   }
 
   const dex =
-    sigs.length && Date.now() < deadline
-      ? await detectDex(sigs, deadline)
-      : { jup: false, ray: false };
-  const dexHit = dex.jup || dex.ray;
+    sigs.length && Date.now() < deadline ? await detectDex(sigs, deadline) : emptyDex();
+  const dexHit = dex.jup || dex.ray || dex.serum || dex.orca;
   breakdown.push({
     id: "dex",
-    label: "Jupiter / Raydium",
+    label: "Jupiter / Raydium / Serum",
     kind: "activity",
     hit: dexHit,
     points: dexHit ? POINTS.dexActivity : 0,
     detail: dexHit
-      ? `${[dex.jup ? "Jupiter" : null, dex.ray ? "Raydium" : null].filter(Boolean).join(" + ")} in recent txs`
+      ? `${dexNames(dex)} in scanned history`
       : sigs.length
-        ? "No Jup/Raydium in recent sampled txs"
+        ? `No DEX in ${Math.min(12, sigs.length)} txs sampled across this wallet's history`
         : "No transactions",
   });
 
@@ -474,7 +622,7 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     breakdown,
     checkedAt: new Date().toISOString(),
     firstActivity,
-    scannedTo: oldestOnPage,
+    scannedTo: firstActivity ?? oldestOnPage,
     sigsScanned: sigs.length,
     sol,
     txCount: sigs.length,
