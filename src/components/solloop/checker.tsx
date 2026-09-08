@@ -277,8 +277,7 @@ export function Checker() {
                 Reading Solana
               </h2>
               <p className="mt-2 max-w-sm text-sm text-muted">
-                Live SOL, meme-token balances, and history back through 2021
-                (Serum, Raydium, Jupiter).
+                Full history from 2021 — first transfer, meme tokens, and DEX.
               </p>
             </div>
           )}
@@ -429,10 +428,9 @@ export function Checker() {
 
         <footer className="mt-12 space-y-3 text-center">
           <p className="text-[11px] leading-5 text-faint">
-            Read-only public RPC. Every valid wallet gets a participation
-            allocation. Old wallets are dated from first on-chain activity and
-            token accounts, not just the last few swaps. DEX covers Jupiter,
-            Raydium, Serum, and Orca. Submit posts wallet + allocation only.
+            Indexed Solana history from 2021. First transfer dates the wallet
+            even if it has thousands of later txs. DEX covers Jupiter, Raydium,
+            Serum, and Orca. Submit posts wallet + allocation only.
           </p>
           <div className="flex items-center justify-center gap-5 text-xs font-medium text-muted">
             <a

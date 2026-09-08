@@ -14,6 +14,7 @@ import {
 } from "@/lib/config";
 import { isSolanaAddress } from "@/lib/address";
 import type { BreakdownRow, WalletCheckResult } from "@/lib/types";
+import { scanSolscan } from "@/lib/solscan";
 
 type RpcResult<T> = { result?: T; error?: { message?: string } };
 
@@ -426,31 +427,35 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     detail: "Valid Solana address — participation allocation",
   });
 
-  const [balanceRes, tokenRes, sigRes, nftRes] = await Promise.allSettled([
+  const [solscanRes, balanceRes, tokenRes, sigRes, nftRes] = await Promise.allSettled([
+    scanSolscan(wallet, deadline),
     rpcBest<unknown>("getBalance", [wallet], 2_800),
     loadTokenAccounts(wallet),
     signaturesFor(wallet, { limit: 1000 }),
     fetchNfts(wallet),
   ]);
 
+  const scanned = solscanRes.status === "fulfilled" ? solscanRes.value : null;
   const lamports = balanceRes.status === "fulfilled" ? parseBalance(balanceRes.value) : 0;
-  const sol = lamportsToSol(lamports);
+  const rpcSol = lamportsToSol(lamports);
+  const sol = scanned?.sol ?? rpcSol;
   const tokenPack = tokenRes.status === "fulfilled" ? tokenRes.value : null;
-  const liveTokens = tokenPack?.live ?? null;
-  const tokenError = tokenRes.status === "rejected";
+  const liveTokens = scanned?.live ?? tokenPack?.live ?? null;
+  const tokenError = tokenRes.status === "rejected" && !scanned?.live;
   const firstPage = sigRes.status === "fulfilled" ? sigRes.value : [];
   const nfts = nftRes.status === "fulfilled" ? nftRes.value : null;
 
+  const solscanHasAge = scanned?.firstActivity != null && scanned.firstActivity < YEAR_2024_TS;
   const history =
-    firstPage.length && Date.now() < deadline
+    !solscanHasAge && firstPage.length && Date.now() < deadline
       ? await rewindHistory(wallet, firstPage, deadline)
       : { sigs: firstPage, exhausted: firstPage.length > 0 && firstPage.length < 1000 };
 
   const sigs = history.sigs;
-  const reachedGenesis = history.exhausted;
+  const reachedGenesis = history.exhausted || solscanHasAge;
 
   let ataOldest: number | null = null;
-  if (tokenPack?.agePubkeys.length && Date.now() < deadline) {
+  if (!solscanHasAge && tokenPack?.agePubkeys.length && Date.now() < deadline) {
     const times = await Promise.all(
       tokenPack.agePubkeys.map((pk) => oldestSignatureTime(pk, deadline)),
     );
@@ -461,14 +466,16 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     .map((s) => s.blockTime)
     .filter((t): t is number => typeof t === "number");
   const oldestOnPage = minTime(times);
-  const firstActivity = minTime([oldestOnPage, ataOldest]);
+  const firstActivity = minTime([oldestOnPage, ataOldest, scanned?.firstActivity ?? null]);
   const confirmed2023 = firstActivity !== null && firstActivity < YEAR_2024_TS;
-  const unknown2023 = !reachedGenesis && !confirmed2023 && sigs.length > 0;
+  const unknown2023 = !reachedGenesis && !confirmed2023 && (sigs.length > 0 || (scanned?.txCount ?? 0) > 0);
 
   const hasActivity =
     sigs.length > 0 ||
+    (scanned?.txCount ?? 0) > 0 ||
     sol > 0 ||
     Boolean(liveTokens && Object.values(liveTokens).some((t) => t.ui > 0));
+  const txShown = Math.max(sigs.length, scanned?.txCount ?? 0);
   breakdown.push({
     id: "active-wallet",
     label: "On-chain wallet",
@@ -476,24 +483,24 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     hit: hasActivity,
     points: hasActivity ? POINTS.activeWallet : 0,
     detail: hasActivity
-      ? `${sigs.length ? `${sigs.length}${reachedGenesis ? "" : "+"} txs` : "balances"} on Solana`
+      ? `${txShown ? `${txShown}${reachedGenesis ? "" : "+"} txs` : "balances"} on Solana`
       : "No transactions or balances found",
   });
 
   const solHit = sol > 0;
+  const solUnavailable = balanceRes.status === "rejected" && scanned?.sol == null;
   breakdown.push({
     id: "sol",
     label: "SOL balance",
     kind: "live",
     hit: solHit,
     points: solHit ? POINTS.sol : 0,
-    unavailable: balanceRes.status === "rejected",
-    detail:
-      balanceRes.status === "rejected"
-        ? "Could not read SOL"
-        : solHit
-          ? `${sol.toLocaleString("en-US", { maximumFractionDigits: 4 })} SOL`
-          : "0 SOL",
+    unavailable: solUnavailable,
+    detail: solUnavailable
+      ? "Could not read SOL"
+      : solHit
+        ? `${sol.toLocaleString("en-US", { maximumFractionDigits: 4 })} SOL`
+        : "0 SOL",
   });
 
   breakdown.push({
@@ -513,14 +520,15 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
   });
 
   const tokenAtaOldest: Record<string, number | null> = {};
-  if (liveTokens && Date.now() < deadline) {
+  for (const token of TOKENS) {
+    tokenAtaOldest[token.id] = scanned?.tokenFirst[token.id] ?? null;
+  }
+  const missingAta = TOKENS.filter((t) => tokenAtaOldest[t.id] == null && liveTokens?.[t.id]?.pubkey);
+  if (missingAta.length && Date.now() < deadline) {
     await Promise.all(
-      TOKENS.map(async (token) => {
-        const pk = liveTokens[token.id]?.pubkey;
-        if (!pk || Date.now() > deadline) {
-          tokenAtaOldest[token.id] = null;
-          return;
-        }
+      missingAta.map(async (token) => {
+        const pk = liveTokens?.[token.id]?.pubkey;
+        if (!pk || Date.now() > deadline) return;
         tokenAtaOldest[token.id] = await oldestSignatureTime(pk, deadline);
       }),
     );
@@ -574,8 +582,19 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     });
   }
 
-  const dex =
-    sigs.length && Date.now() < deadline ? await detectDex(sigs, deadline) : emptyDex();
+  const solscanDex = scanned?.dex ?? emptyDex();
+  const solscanDexHit = solscanDex.jup || solscanDex.ray || solscanDex.serum || solscanDex.orca;
+  const dex = solscanDexHit
+    ? solscanDex
+    : sigs.length && Date.now() < deadline
+      ? await detectDex(sigs, deadline)
+      : solscanDex;
+  if (!solscanDexHit) {
+    dex.jup = dex.jup || solscanDex.jup;
+    dex.ray = dex.ray || solscanDex.ray;
+    dex.serum = dex.serum || solscanDex.serum;
+    dex.orca = dex.orca || solscanDex.orca;
+  }
   const dexHit = dex.jup || dex.ray || dex.serum || dex.orca;
   breakdown.push({
     id: "dex",
@@ -584,14 +603,26 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     hit: dexHit,
     points: dexHit ? POINTS.dexActivity : 0,
     detail: dexHit
-      ? `${dexNames(dex)} in scanned history`
-      : sigs.length
-        ? `No DEX in ${Math.min(12, sigs.length)} txs sampled across this wallet's history`
+      ? `${dexNames(dex)} in full history`
+      : txShown
+        ? "No Jupiter / Raydium / Serum / Orca in indexed history"
         : "No transactions",
   });
 
   for (const nft of NFTS) {
-    if (nfts === null) {
+    const fromScan = scanned?.nftHits?.[nft.id];
+    if (fromScan) {
+      breakdown.push({
+        id: `nft-${nft.id}`,
+        label: nft.label,
+        kind: "nft",
+        hit: true,
+        points: POINTS.nft,
+        detail: "Held in wallet",
+      });
+      continue;
+    }
+    if (nfts === null && scanned?.nftHits == null) {
       breakdown.push({
         id: `nft-${nft.id}`,
         label: nft.label,
@@ -603,7 +634,7 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
       });
       continue;
     }
-    const hit = nftHit(nfts, nft.match);
+    const hit = nfts ? nftHit(nfts, nft.match) : false;
     breakdown.push({
       id: `nft-${nft.id}`,
       label: nft.label,
@@ -623,9 +654,9 @@ async function runCheck(wallet: string): Promise<WalletCheckResult> {
     checkedAt: new Date().toISOString(),
     firstActivity,
     scannedTo: firstActivity ?? oldestOnPage,
-    sigsScanned: sigs.length,
+    sigsScanned: txShown,
     sol,
-    txCount: sigs.length,
+    txCount: txShown,
   };
 }
 
