@@ -428,9 +428,9 @@ export function Checker() {
 
         <footer className="mt-12 space-y-3 text-center">
           <p className="text-[11px] leading-5 text-faint">
-            Indexed Solana history from 2021. First transfer dates the wallet
-            even if it has thousands of later txs. DEX covers Jupiter, Raydium,
-            Serum, and Orca. Submit posts wallet + allocation only.
+            Solscan API v2 indexes history from 2021. First transfer dates the
+            wallet even if it has thousands of later txs. DEX covers Jupiter,
+            Raydium, Serum, and Orca. Submit posts wallet + allocation only.
           </p>
           <div className="flex items-center justify-center gap-5 text-xs font-medium text-muted">
             <a

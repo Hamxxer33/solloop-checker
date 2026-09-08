@@ -77,6 +77,7 @@ async function solscanGet(
     const res = await fetch(url, {
       headers: {
         token: key,
+        Authorization: key,
         accept: "application/json",
         "user-agent": "Mozilla/5.0 (compatible; SOLLOOP-checker/1.0)",
       },
@@ -133,7 +134,7 @@ export async function scanSolscan(wallet: string, deadline: number): Promise<Sol
   const mintBy = new Map(TOKENS.map((t) => [t.mint, t]));
   const nftNeedles = NFTS.map((n) => ({ id: n.id, match: n.match }));
 
-  const [detailJson, tokensJson, nftJson, firstTransfersJson, dexOldJson, dexNewJson] =
+  const [detailJson, tokensJson, nftJson, firstTransfersJson, dexOldJson, dexNewJson, txJson] =
     await Promise.all([
       solscanGet("/account/detail", { address: wallet }),
       solscanGet("/account/token-accounts", {
@@ -173,6 +174,7 @@ export async function scanSolscan(wallet: string, deadline: number): Promise<Sol
         sort_order: "desc",
         activity_type: ["ACTIVITY_TOKEN_SWAP", "ACTIVITY_AGG_TOKEN_SWAP"],
       }),
+      solscanGet("/account/transactions", { address: wallet, limit: 40 }),
     ]);
 
   const detail = asRecord(dataOf(detailJson));
@@ -242,6 +244,15 @@ export async function scanSolscan(wallet: string, deadline: number): Promise<Sol
     if (ts !== null) firstActivity = firstActivity === null ? ts : Math.min(firstActivity, ts);
   }
 
+  const txs = asArray(dataOf(txJson));
+  for (const row of txs) {
+    const rec = asRecord(row);
+    const ts = rec ? num(rec.block_time) ?? num(rec.time) : null;
+    if (ts !== null) firstActivity = firstActivity === null ? ts : Math.min(firstActivity, ts);
+    if (rec) noteDex(dex, rec.program_ids ?? rec.parsed_instructions ?? rec);
+  }
+  transfersScanned = Math.max(transfersScanned, txs.length);
+
   if (Date.now() < deadline) {
     const tokenQueries = TOKENS.map((token) =>
       solscanGet("/account/transfer", {
@@ -284,7 +295,7 @@ export async function scanSolscan(wallet: string, deadline: number): Promise<Sol
     });
   }
 
-  const ok = Boolean(detailJson || firstTransfersJson || tokensJson || dexOldJson);
+  const ok = Boolean(detailJson || firstTransfersJson || tokensJson || dexOldJson || txJson);
   return {
     ok,
     sol,
