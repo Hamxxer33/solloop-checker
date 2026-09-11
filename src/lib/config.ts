@@ -71,7 +71,7 @@ export const TOKENOMICS = {
       amount: 2_500_000_000,
       tone: "accent" as const,
       group: "community" as const,
-      detail: "NFT sale coming soon. Allocation follows holders.",
+      detail: "NFT collection is live. Allocation follows holders.",
       vesting: {
         tgePercent: 0,
         cliffMonths: 0,
@@ -129,10 +129,9 @@ export const TASKS: Task[] = [
   {
     id: "nft",
     label: "Hold Solloop NFT",
-    url: "#",
+    url: "https://launchmynft.io/collections/8fC9B98vJYJXp6u2zTMDKagMHcwkhF1PkrFZGwErC8pA/ujbbQ5Cqz6qCKQMilsuk",
     required: false,
-    enabled: false,
-    note: "Coming soon",
+    enabled: true,
   },
 ];
 
