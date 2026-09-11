@@ -475,7 +475,12 @@ function TaskList({
           <li key={task.id} className="flex items-stretch gap-2">
             <button
               type="button"
-              onClick={() => onToggle(task.id)}
+              onClick={() => {
+                if (task.url && task.url !== "#") {
+                  window.open(task.url, "_blank", "noopener,noreferrer");
+                }
+                onToggle(task.id);
+              }}
               className={cn(
                 "flex min-h-12 flex-1 items-center gap-3 rounded-lg px-4 py-3 text-left shadow-[0_0_0_1px_rgb(244_244_245_/_0.1)]",
                 on && "bg-ok/10 shadow-[0_0_0_1px_rgb(74_222_128_/_0.35)]",
