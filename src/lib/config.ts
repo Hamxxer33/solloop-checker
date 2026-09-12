@@ -127,9 +127,9 @@ export const TASKS: Task[] = [
     enabled: true,
   },
   {
-    id: "x-post-2098696198643421586",
+    id: "x-post-2098800803993821457",
     label: "Like, comment, repost, and turn on notifications for this X post",
-    url: "https://x.com/Solloop/status/2098696198643421586",
+    url: "https://x.com/Solloop/status/2098800803993821457",
     required: true,
     enabled: true,
   },
